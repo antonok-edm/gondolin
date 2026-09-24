@@ -12,11 +12,13 @@ import { Duplex } from "stream";
 import { monitorEventLoopDelay, performance } from "perf_hooks";
 import forge from "node-forge";
 
+import { MAX_SNI_PREPARSE_BYTES, parseSniFromClientHello } from "./tls-sni.ts";
 import {
   generatePositiveSerialNumber,
   getCertificateSubjectKeyIdentifierBytes,
   isNonNegativeSerialNumberHex,
   loadOrCreateMitmCa,
+  loadOrCreateMitmCaSync,
   mitmLeafHasRequiredKeyIdentifiers,
   resolveMitmCertDir,
 } from "../mitm.ts";
@@ -73,6 +75,10 @@ import {
 import { QemuIcmpTracker, type IcmpTiming } from "./icmp.ts";
 
 const GUEST_CLOSED_ERR = createGuestClosedError();
+
+function isBunRuntime(): boolean {
+  return typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+}
 
 export const DEFAULT_MAX_HTTP_BODY_BYTES = 64 * 1024 * 1024;
 // Default cap for buffering upstream HTTP *responses* (not streaming).
@@ -210,6 +216,8 @@ export type TcpSession = {
   pendingWriteBytes: number;
   http?: HttpSession;
   tls?: TlsSession;
+  /** Bun-only: buffered ClientHello bytes awaiting SNI pre-parse in `bytes` */
+  tlsHelloBuf?: Buffer;
 
   /** active WebSocket upgrade/tunnel state */
   ws?: WebSocketState;
@@ -1165,7 +1173,11 @@ export class QemuNetworkBackend extends EventEmitter {
     });
   }
 
-  private ensureTlsSession(key: string, session: TcpSession) {
+  private ensureTlsSession(
+    key: string,
+    session: TcpSession,
+    prebuiltContext?: tls.SecureContext,
+  ) {
     if (session.tls) return session.tls;
 
     const stream = new GuestTlsStream(async (chunk) => {
@@ -1177,6 +1189,7 @@ export class QemuNetworkBackend extends EventEmitter {
     const tlsSocket = new tls.TLSSocket(stream, {
       isServer: true,
       ALPNProtocols: ["http/1.1"],
+      ...(prebuiltContext ? { secureContext: prebuiltContext } : {}),
       SNICallback: (servername, callback) => {
         const sni = servername || session.dstIP;
         this.getTlsContextAsync(sni)
@@ -1221,9 +1234,52 @@ export class QemuNetworkBackend extends EventEmitter {
   }
 
   private handleTlsData(key: string, session: TcpSession, data: Buffer) {
+    if (isBunRuntime()) {
+      this.handleTlsDataBun(key, session, data);
+      return;
+    }
     const tlsSession = this.ensureTlsSession(key, session);
     if (!tlsSession) return;
     tlsSession.stream.pushEncrypted(data);
+  }
+
+  private handleTlsDataBun(key: string, session: TcpSession, data: Buffer) {
+    session.tlsHelloBuf = session.tlsHelloBuf
+      ? Buffer.concat([session.tlsHelloBuf, data])
+      : Buffer.from(data);
+    const buf = session.tlsHelloBuf;
+    if (!session.tls) {
+      let sni: string | null | undefined;
+      try {
+        sni = parseSniFromClientHello(buf);
+      } catch {
+        sni = undefined;
+      }
+      // `null` means the first record is not complete yet - keep buffering
+      if (sni === null && buf.length < MAX_SNI_PREPARSE_BYTES) {
+        return;
+      }
+      const name = sni || session.dstIP;
+      if (this.options.debug) {
+        this.emitDebug(`tls bun pre-sni ${name}`);
+      }
+      let context: tls.SecureContext;
+      try {
+        context = this.getTlsContextSync(name);
+      } catch (err) {
+        if (this.options.debug) {
+          this.emitDebug(`tls bun context error ${formatError(err)}`);
+        }
+        this.emit("error", err);
+        this.stack?.handleTcpError({ key });
+        return;
+      }
+      const tlsSession = this.ensureTlsSession(key, session, context);
+      tlsSession.stream.pushEncrypted(buf);
+      session.tlsHelloBuf = undefined;
+      return;
+    }
+    session.tls.stream.pushEncrypted(data);
   }
 
   private getMitmDir() {
@@ -1330,6 +1386,130 @@ export class QemuNetworkBackend extends EventEmitter {
       key: keyPem,
       cert: `${certPem}\n${ca.certPem}`,
     });
+  }
+
+  /**
+   * Bun MITM requires synchronous implementation.
+   */
+  private getTlsContextSync(servername: string): tls.SecureContext {
+    const normalized = servername.trim() || "unknown";
+    const cached = this.tlsContexts.get(normalized);
+    if (cached) {
+      cached.lastAccessAt = Date.now();
+      // LRU: move to the end.
+      this.tlsContexts.delete(normalized);
+      this.tlsContexts.set(normalized, cached);
+      return cached.context;
+    }
+
+    const ca = loadOrCreateMitmCaSync(this.mitmDir);
+    const { keyPem, certPem } = this.ensureLeafCertificateSync(servername, ca);
+
+    const context = tls.createSecureContext({
+      key: keyPem,
+      cert: `${certPem}\n${ca.certPem}`,
+    });
+    this.tlsContexts.set(normalized, {
+      context,
+      lastAccessAt: Date.now(),
+    });
+    this.evictTlsContextCacheIfNeeded();
+    return context;
+  }
+
+  /**
+   * Bun MITM requires synchronous implementation.
+   */
+  private ensureLeafCertificateSync(
+    servername: string,
+    ca: CaCert,
+  ): { keyPem: string; certPem: string } {
+    const hostsDir = path.join(this.getMitmDir(), "hosts");
+    fs.mkdirSync(hostsDir, { recursive: true });
+
+    const hash = crypto
+      .createHash("sha256")
+      .update(servername)
+      .digest("hex")
+      .slice(0, 12);
+    const slug = servername.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const baseName = `${slug || "host"}-${hash}`;
+
+    const keyPath = path.join(hostsDir, `${baseName}.key`);
+    const certPath = path.join(hostsDir, `${baseName}.crt`);
+
+    try {
+      const keyPem = fs.readFileSync(keyPath, "utf8");
+      const certPem = fs.readFileSync(certPath, "utf8");
+      const cert = forge.pki.certificateFromPem(certPem);
+      if (!isNonNegativeSerialNumberHex(cert.serialNumber)) {
+        throw new Error("persisted mitm leaf cert has an unsafe serial number");
+      }
+      if (!caCertVerifiesLeaf(ca.cert, cert)) {
+        throw new Error("persisted mitm leaf cert is not signed by current ca");
+      }
+      if (!mitmLeafHasRequiredKeyIdentifiers(ca.cert, cert)) {
+        throw new Error(
+          "persisted mitm leaf cert is missing required key identifiers",
+        );
+      }
+      if (!privateKeyMatchesLeafCert(keyPem, cert)) {
+        throw new Error("persisted mitm leaf key does not match cert");
+      }
+      return { keyPem, certPem };
+    } catch {
+      // Generate new leaf certificate
+      const keys = forge.pki.rsa.generateKeyPair(2048);
+      const cert = forge.pki.createCertificate();
+
+      cert.publicKey = keys.publicKey;
+      cert.serialNumber = generatePositiveSerialNumber();
+      const now = new Date(Date.now() - 5 * 60 * 1000);
+      cert.validity.notBefore = now;
+      cert.validity.notAfter = new Date(now);
+      cert.validity.notAfter.setDate(cert.validity.notBefore.getDate() + 825);
+
+      const safeName = servername.replace(/[\r\n]/g, "");
+      const attrs = [{ name: "commonName", value: safeName }];
+      cert.setSubject(attrs);
+      cert.setIssuer(ca.cert.subject.attributes);
+
+      const altNames = net.isIP(servername)
+        ? [{ type: 7, ip: servername }]
+        : [{ type: 2, value: servername }];
+      const caSubjectKeyIdentifier = getCertificateSubjectKeyIdentifierBytes(
+        ca.cert,
+      );
+      if (caSubjectKeyIdentifier === undefined) {
+        throw new Error("mitm ca cert is missing required key identifiers");
+      }
+
+      cert.setExtensions([
+        { name: "basicConstraints", cA: false },
+        {
+          name: "keyUsage",
+          digitalSignature: true,
+          keyEncipherment: true,
+        },
+        { name: "extKeyUsage", serverAuth: true },
+        { name: "subjectAltName", altNames },
+        { name: "subjectKeyIdentifier" },
+        {
+          name: "authorityKeyIdentifier",
+          keyIdentifier: caSubjectKeyIdentifier,
+        },
+      ]);
+
+      cert.sign(ca.key, forge.md.sha256.create());
+
+      const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
+      const certPem = forge.pki.certificateToPem(cert);
+
+      fs.writeFileSync(keyPath, keyPem);
+      fs.writeFileSync(certPath, certPem);
+
+      return { keyPem, certPem };
+    }
   }
 
   private async ensureLeafCertificateAsync(
