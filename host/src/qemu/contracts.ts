@@ -138,6 +138,10 @@ export type TcpSession = {
   http?: any;
   tls?: {
     socket: tls.TLSSocket;
+    /** Plaintext bytes pushed into the MITM TLSSocket, in `bytes` */
+    plaintextBytes: number;
+    /** Ciphertext bytes delivered to the guest flow, in `bytes` */
+    encryptedBytes: number;
   };
   ws?: any;
   ssh?: any;
@@ -171,5 +175,9 @@ export type QemuNetworkBackend<
   flush(): void;
   waitForFlowResume(key: string): Promise<void>;
   settleFlowResume(key: string, err?: Error): void;
+  /** backpressure for MITM TLS: block the pipeline while ciphertext delivery lags */
+  waitForTlsWritable(key: string, session: TSession): Promise<void>;
+  /** resolve when all plaintext pushed into the MITM TLSSocket reached the flow */
+  waitForTlsDrained(key: string, session: TSession): Promise<void>;
   abortTcpSession(key: string, session: TSession, reason: string): void;
 };

@@ -161,6 +161,10 @@ type TlsSession = {
   stream: GuestTlsStream;
   socket: tls.TLSSocket;
   servername: string | null;
+  /** plaintext bytes pushed into the MITM TLSSocket by the HTTP pipeline, in `bytes` */
+  plaintextBytes: number;
+  /** ciphertext bytes actually handed to the guest flow, in `bytes` */
+  encryptedBytes: number;
 };
 
 class ActivityMap<K, V> extends Map<K, V> {
@@ -945,6 +949,50 @@ export class QemuNetworkBackend extends EventEmitter {
     return { allowRawTcp: Boolean(mappedTcp) };
   }
 
+  /**
+   * Max plaintext pushed into the MITM TLSSocket but not yet delivered to the
+   * guest flow, in `bytes`. Beyond this, `waitForTlsWritable` blocks the HTTP
+   * pipeline so the plaintext backlog stays bounded.
+   */
+  static readonly TLS_MAX_PENDING_CIPHERTEXT_BYTES = 256 * 1024;
+
+  /**
+   * @internal Backpressure for MITM TLS responses: resolves once the flow is
+   * resumed AND the plaintext→ciphertext backlog is below the watermark, so
+   * completing a body write means it actually reached the guest flow.
+   */
+  async waitForTlsWritable(key: string, session: TcpSession): Promise<void> {
+    const tlsSession = session.tls;
+    if (!tlsSession) return;
+    for (;;) {
+      if (this.tcpSessions.get(key) !== session) return;
+      await this.waitForFlowResume(key);
+      const backlog = tlsSession.plaintextBytes - tlsSession.encryptedBytes;
+      if (
+        backlog <= QemuNetworkBackend.TLS_MAX_PENDING_CIPHERTEXT_BYTES ||
+        session.tls !== tlsSession
+      ) {
+        return;
+      }
+      await waitForTlsProgress(tlsSession.stream);
+    }
+  }
+
+  /**
+   * @internal Resolves once every plaintext byte pushed into the MITM
+   * TLSSocket for this flow has been delivered as ciphertext to the guest
+   * flow. Used by the HTTP pipeline before ending the TLS session.
+   */
+  async waitForTlsDrained(key: string, session: TcpSession): Promise<void> {
+    const tlsSession = session.tls;
+    if (!tlsSession) return;
+    for (;;) {
+      if (this.tcpSessions.get(key) !== session) return;
+      if (tlsSession.plaintextBytes - tlsSession.encryptedBytes <= 0) return;
+      await waitForTlsProgress(tlsSession.stream);
+    }
+  }
+
   /** @internal */
   abortTcpSession(key: string, session: TcpSession, reason: string) {
     if (this.options.debug) {
@@ -1181,9 +1229,17 @@ export class QemuNetworkBackend extends EventEmitter {
     if (session.tls) return session.tls;
 
     const stream = new GuestTlsStream(async (chunk) => {
+      if (session.tls) {
+        session.tls.encryptedBytes += chunk.length;
+      }
       this.stack?.handleTcpData({ key, data: chunk });
       this.flush();
-      await this.waitForFlowResume(key);
+      try {
+        await this.waitForFlowResume(key);
+      } finally {
+        // Delivered: release any waitForTlsWritable/waitForTlsDrained waiter.
+        session.tls?.stream.emit("tls-progress");
+      }
     });
 
     const tlsSocket = new tls.TLSSocket(stream, {
@@ -1224,6 +1280,8 @@ export class QemuNetworkBackend extends EventEmitter {
       stream,
       socket: tlsSocket,
       servername: null,
+      plaintextBytes: 0,
+      encryptedBytes: 0,
     };
 
     if (this.options.debug) {
@@ -1613,4 +1671,23 @@ export class QemuNetworkBackend extends EventEmitter {
 function formatError(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+/**
+ * Wait for the next ciphertext delivery on a MITM TLS stream (`tls-progress`
+ * is emitted after each delivered chunk), with a safety timeout so a missing
+ * event can never wedge the caller: the flow teardown paths settle everything
+ * separately.
+ */
+function waitForTlsProgress(stream: GuestTlsStream): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timeout = setTimeout(done, 1000);
+    const onProgress = () => done();
+    function done() {
+      clearTimeout(timeout);
+      stream.off("tls-progress", onProgress);
+      resolve();
+    }
+    stream.once("tls-progress", onProgress);
+  });
 }

@@ -228,15 +228,25 @@ export async function handleTlsHttpData(
   await handleHttpDataWithWriter(backend, key, session, data, {
     scheme: "https",
     write: (chunk: Buffer) => {
+      tlsSession.plaintextBytes += chunk.length;
       tlsSession.socket.write(chunk);
     },
     finish: () => {
-      tlsSession.socket.end(() => {
-        backend.stack?.handleTcpEnd({ key });
-        backend.flush();
-      });
+      // The MITM TLSSocket buffers plaintext internally and, under Bun, fires
+      // the end() callback without flushing that backlog to the backpressured
+      // wrapped stream — wait for the pipeline to drain before ending, or the
+      // guest gets a truncated response.
+      void backend
+        .waitForTlsDrained(key, session)
+        .catch(() => {})
+        .then(() => {
+          tlsSession.socket.end(() => {
+            backend.stack?.handleTcpEnd({ key });
+            backend.flush();
+          });
+        });
     },
-    waitForWritable: () => backend.waitForFlowResume(key),
+    waitForWritable: () => backend.waitForTlsWritable(key, session),
   });
 }
 
