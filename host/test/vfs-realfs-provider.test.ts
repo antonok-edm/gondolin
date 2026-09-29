@@ -429,6 +429,105 @@ test("RealFSProvider rename does not follow final symlink components", (t) => {
   );
 });
 
+test("RealFSProvider errors do not leak the host mount path", async (t) => {
+  const root = makeTempDir(t);
+  const resolvedRoot = fs.realpathSync(path.resolve(root));
+  const provider = new RealFSProvider(root);
+  fs.mkdirSync(path.join(root, "dir"));
+  fs.writeFileSync(path.join(root, "file.txt"), "data");
+
+  const assertNoHostLeak = (err: unknown): boolean => {
+    const e = err as NodeJS.ErrnoException;
+    assert.ok(
+      !String(e.message).includes(resolvedRoot),
+      `error message leaks host path: ${e.message}`,
+    );
+    if (typeof e.path === "string") {
+      assert.ok(
+        !e.path.includes(resolvedRoot),
+        `err.path leaks host path: ${e.path}`,
+      );
+    }
+    return true;
+  };
+
+  // async + sync stat on a missing entry
+  await assert.rejects(
+    () => provider.stat("/missing.txt"),
+    (err: NodeJS.ErrnoException) => {
+      assertNoHostLeak(err);
+      assert.ok(isENOENT(err), `expected ENOENT, got: ${err.message}`);
+      assert.ok(
+        err.message.includes("./missing.txt"),
+        `expected VFS path in message: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.throws(() => provider.statSync("/missing.txt"), assertNoHostLeak);
+
+  // readdir on missing dir, mkdir under missing dir, unlink missing file
+  await assert.rejects(() => provider.readdir("/missing-dir"), assertNoHostLeak);
+  await assert.rejects(
+    () => provider.mkdir("/missing-dir/sub"),
+    assertNoHostLeak,
+  );
+  await assert.rejects(() => provider.unlink("/missing.txt"), assertNoHostLeak);
+  await assert.rejects(() => provider.access("/missing.txt"), assertNoHostLeak);
+  await assert.rejects(() => provider.open("/missing.txt", "r"), assertNoHostLeak);
+  assert.throws(
+    () => provider.openSync("/missing.txt", "r"),
+    assertNoHostLeak,
+  );
+
+  // rename error names both source and destination
+  await assert.rejects(
+    () => provider.rename("/file.txt", "/missing-dir/file.txt"),
+    (err: NodeJS.ErrnoException) => {
+      assertNoHostLeak(err);
+      assert.ok(isENOENT(err), `expected ENOENT, got: ${err.message}`);
+      assert.ok(
+        err.message.includes("./missing-dir/file.txt"),
+        `expected VFS dest path in message: ${err.message}`,
+      );
+      return true;
+    },
+  );
+  assert.throws(
+    () => provider.renameSync("/file.txt", "/missing-dir/file.txt"),
+    assertNoHostLeak,
+  );
+
+  // file handle ops: with the file deleted out from under an open handle,
+  // fs.readFile(realPath) fails with ENOENT embedding the host real path
+  const fh = provider.openSync("/file.txt", "r");
+  fs.rmSync(path.join(resolvedRoot, "file.txt"));
+  try {
+    await assert.rejects(
+      () => fh.readFile(),
+      (err: NodeJS.ErrnoException) => {
+        assertNoHostLeak(err);
+        assert.ok(isENOENT(err), `expected ENOENT, got: ${err.message}`);
+        assert.ok(
+          err.message.includes("/file.txt"),
+          `expected VFS path in message: ${err.message}`,
+        );
+        return true;
+      },
+    );
+    assert.throws(() => fh.readFileSync(), assertNoHostLeak);
+  } finally {
+    fh.closeSync();
+  }
+
+  // successful ops are unaffected
+  fs.writeFileSync(path.join(resolvedRoot, "file.txt"), "data");
+  const fh2 = await provider.open("/file.txt", "r");
+  assert.equal(await fh2.readFile({ encoding: "utf8" }), "data");
+  await fh2.close();
+  assert.equal(provider.statSync("/file.txt").isFile(), true);
+});
+
 test("RealFSProvider statfs reports host filesystem stats", async (t) => {
   const root = makeTempDir(t);
   const provider = new RealFSProvider(root);

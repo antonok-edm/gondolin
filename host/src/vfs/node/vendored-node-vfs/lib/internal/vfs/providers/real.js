@@ -92,24 +92,58 @@ class RealFileHandle extends VirtualFileHandle {
     });
   }
 
+  // XXX(patch): Custom code/changes added for Gondolin
+  // node:fs embeds the path passed to a syscall in errno error messages
+  // (and in `err.path`). These operations pass the host real path, so an
+  // unmodified error would leak the host filesystem layout to callers on
+  // the sandboxed side. Remap it back to the VFS path the caller used.
+  _scrubError(error) {
+    if (!error || typeof error !== 'object') {
+      return error;
+    }
+    if (typeof error.message === 'string') {
+      error.message = error.message.split(this.#realPath).join(this.path);
+    }
+    if (typeof error.path === 'string') {
+      error.path = error.path.split(this.#realPath).join(this.path);
+    }
+    return error;
+  }
+
   readFileSync(options) {
     this._checkClosed();
-    return fs.readFileSync(this.#realPath, options);
+    try {
+      return fs.readFileSync(this.#realPath, options);
+    } catch (error) {
+      throw this._scrubError(error);
+    }
   }
 
   async readFile(options) {
     this._checkClosed();
-    return fs.promises.readFile(this.#realPath, options);
+    try {
+      return await fs.promises.readFile(this.#realPath, options);
+    } catch (error) {
+      throw this._scrubError(error);
+    }
   }
 
   writeFileSync(data, options) {
     this._checkClosed();
-    fs.writeFileSync(this.#realPath, data, options);
+    try {
+      fs.writeFileSync(this.#realPath, data, options);
+    } catch (error) {
+      throw this._scrubError(error);
+    }
   }
 
   async writeFile(data, options) {
     this._checkClosed();
-    return fs.promises.writeFile(this.#realPath, data, options);
+    try {
+      return await fs.promises.writeFile(this.#realPath, data, options);
+    } catch (error) {
+      throw this._scrubError(error);
+    }
   }
 
   statSync(options) {
@@ -242,6 +276,47 @@ class RealFSProvider extends VirtualProvider {
     return StringPrototypeStartsWith(resolvedPath, rootWithSep);
   }
 
+  // XXX(patch): Custom code/changes added for Gondolin
+  // node:fs embeds the path passed to a syscall in errno error messages
+  // (and in `err.path`). Provider methods pass host-resolved real paths, so
+  // an unmodified error would leak the host filesystem layout (the mount
+  // root) to callers on the sandboxed side. The resolved real path is always
+  // `#rootPath + <vfs path>`, so re-expressing it relative to the mount root
+  // ("./<vfs path>", or "." for the root itself) removes the host path while
+  // staying unambiguous about what the path is relative to.
+  _scrubRealPathsFromError(error) {
+    const root = this.#rootPath;
+    if (!root || !error || typeof error !== 'object') {
+      return error;
+    }
+    const sep = root.endsWith(path.sep) ? '' : path.sep;
+    const scrub = (value) =>
+      value.split(root + sep).join('./').split(root).join('.');
+    if (typeof error.message === 'string') {
+      error.message = scrub(error.message);
+    }
+    if (typeof error.path === 'string') {
+      error.path = scrub(error.path);
+    }
+    return error;
+  }
+
+  _runSync(fn) {
+    try {
+      return fn();
+    } catch (error) {
+      throw this._scrubRealPathsFromError(error);
+    }
+  }
+
+  async _runAsync(fn) {
+    try {
+      return await fn();
+    } catch (error) {
+      throw this._scrubRealPathsFromError(error);
+    }
+  }
+
   _assertAncestorWithinRoot(realPath, vfsPath) {
     let current = realPath;
     while (true) {
@@ -256,7 +331,7 @@ class RealFSProvider extends VirtualProvider {
           current = parent;
           continue;
         }
-        throw e;
+        throw this._scrubRealPathsFromError(e);
       }
 
       if (!this._isInsideRoot(resolvedParent)) {
@@ -279,7 +354,7 @@ class RealFSProvider extends VirtualProvider {
       return realPath;
     } catch (error) {
       if (!error || error.code !== 'ENOENT') {
-        throw error;
+        throw this._scrubRealPathsFromError(error);
       }
     }
 
@@ -289,7 +364,7 @@ class RealFSProvider extends VirtualProvider {
       lst = fs.lstatSync(realPath);
     } catch (error) {
       if (!error || error.code !== 'ENOENT') {
-        throw error;
+        throw this._scrubRealPathsFromError(error);
       }
     }
     if (lst && lst.isSymbolicLink()) {
@@ -315,7 +390,7 @@ class RealFSProvider extends VirtualProvider {
 
   openSync(vfsPath, flags, mode) {
     const realPath = this._resolvePathFollow(vfsPath);
-    const fd = fs.openSync(realPath, flags, mode);
+    const fd = this._runSync(() => fs.openSync(realPath, flags, mode));
     return new RealFileHandle(vfsPath, flags, mode ?? 0o644, fd, realPath);
   }
 
@@ -323,7 +398,7 @@ class RealFSProvider extends VirtualProvider {
     const realPath = this._resolvePathFollow(vfsPath);
     return new Promise((resolve, reject) => {
       fs.open(realPath, flags, mode, (err, fd) => {
-        if (err) reject(err);
+        if (err) reject(this._scrubRealPathsFromError(err));
         else resolve(new RealFileHandle(vfsPath, flags, mode ?? 0o644, fd, realPath));
       });
     });
@@ -331,87 +406,87 @@ class RealFSProvider extends VirtualProvider {
 
   statSync(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.statSync(realPath, options);
+    return this._runSync(() => fs.statSync(realPath, options));
   }
 
   async stat(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.promises.stat(realPath, options);
+    return this._runAsync(() => fs.promises.stat(realPath, options));
   }
 
   lstatSync(vfsPath, options) {
     const realPath = this._resolvePathLexical(vfsPath);
-    return fs.lstatSync(realPath, options);
+    return this._runSync(() => fs.lstatSync(realPath, options));
   }
 
   async lstat(vfsPath, options) {
     const realPath = this._resolvePathLexical(vfsPath);
-    return fs.promises.lstat(realPath, options);
+    return this._runAsync(() => fs.promises.lstat(realPath, options));
   }
 
   readdirSync(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.readdirSync(realPath, options);
+    return this._runSync(() => fs.readdirSync(realPath, options));
   }
 
   async readdir(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.promises.readdir(realPath, options);
+    return this._runAsync(() => fs.promises.readdir(realPath, options));
   }
 
   mkdirSync(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.mkdirSync(realPath, options);
+    return this._runSync(() => fs.mkdirSync(realPath, options));
   }
 
   async mkdir(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.promises.mkdir(realPath, options);
+    return this._runAsync(() => fs.promises.mkdir(realPath, options));
   }
 
   rmdirSync(vfsPath) {
     const realPath = this._resolvePathNoFollowFinal(vfsPath);
-    fs.rmdirSync(realPath);
+    this._runSync(() => fs.rmdirSync(realPath));
   }
 
   async rmdir(vfsPath) {
     const realPath = this._resolvePathNoFollowFinal(vfsPath);
-    return fs.promises.rmdir(realPath);
+    return this._runAsync(() => fs.promises.rmdir(realPath));
   }
 
   unlinkSync(vfsPath) {
     const realPath = this._resolvePathNoFollowFinal(vfsPath);
-    fs.unlinkSync(realPath);
+    this._runSync(() => fs.unlinkSync(realPath));
   }
 
   async unlink(vfsPath) {
     const realPath = this._resolvePathNoFollowFinal(vfsPath);
-    return fs.promises.unlink(realPath);
+    return this._runAsync(() => fs.promises.unlink(realPath));
   }
 
   renameSync(oldVfsPath, newVfsPath) {
     const oldRealPath = this._resolvePathNoFollowFinal(oldVfsPath);
     const newRealPath = this._resolvePathNoFollowFinal(newVfsPath);
-    fs.renameSync(oldRealPath, newRealPath);
+    this._runSync(() => fs.renameSync(oldRealPath, newRealPath));
   }
 
   async rename(oldVfsPath, newVfsPath) {
     const oldRealPath = this._resolvePathNoFollowFinal(oldVfsPath);
     const newRealPath = this._resolvePathNoFollowFinal(newVfsPath);
-    return fs.promises.rename(oldRealPath, newRealPath);
+    return this._runAsync(() => fs.promises.rename(oldRealPath, newRealPath));
   }
 
   // XXX(patch): Custom code/changes added for Gondolin
   linkSync(existingVfsPath, newVfsPath) {
     const existingRealPath = this._resolvePathFollow(existingVfsPath);
     const newRealPath = this._resolvePathNoFollowFinal(newVfsPath);
-    fs.linkSync(existingRealPath, newRealPath);
+    this._runSync(() => fs.linkSync(existingRealPath, newRealPath));
   }
 
   async link(existingVfsPath, newVfsPath) {
     const existingRealPath = this._resolvePathFollow(existingVfsPath);
     const newRealPath = this._resolvePathNoFollowFinal(newVfsPath);
-    return fs.promises.link(existingRealPath, newRealPath);
+    return this._runAsync(() => fs.promises.link(existingRealPath, newRealPath));
   }
 
   // XXX(patch): Custom code/changes added for Gondolin
@@ -430,27 +505,27 @@ class RealFSProvider extends VirtualProvider {
 
   readlinkSync(vfsPath, options) {
     const realPath = this._resolvePathLexical(vfsPath);
-    return fs.readlinkSync(realPath, options);
+    return this._runSync(() => fs.readlinkSync(realPath, options));
   }
 
   async readlink(vfsPath, options) {
     const realPath = this._resolvePathLexical(vfsPath);
-    return fs.promises.readlink(realPath, options);
+    return this._runAsync(() => fs.promises.readlink(realPath, options));
   }
 
   symlinkSync(target, vfsPath, type) {
     const realPath = this._resolvePathFollow(vfsPath);
-    fs.symlinkSync(target, realPath, type);
+    this._runSync(() => fs.symlinkSync(target, realPath, type));
   }
 
   async symlink(target, vfsPath, type) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.promises.symlink(target, realPath, type);
+    return this._runAsync(() => fs.promises.symlink(target, realPath, type));
   }
 
   realpathSync(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    const resolved = fs.realpathSync(realPath, options);
+    const resolved = this._runSync(() => fs.realpathSync(realPath, options));
     // Convert back to VFS path
     if (resolved === this.#rootPath) {
       return '/';
@@ -465,7 +540,7 @@ class RealFSProvider extends VirtualProvider {
 
   async realpath(vfsPath, options) {
     const realPath = this._resolvePathFollow(vfsPath);
-    const resolved = await fs.promises.realpath(realPath, options);
+    const resolved = await this._runAsync(() => fs.promises.realpath(realPath, options));
     // Convert back to VFS path
     if (resolved === this.#rootPath) {
       return '/';
@@ -479,24 +554,24 @@ class RealFSProvider extends VirtualProvider {
 
   accessSync(vfsPath, mode) {
     const realPath = this._resolvePathFollow(vfsPath);
-    fs.accessSync(realPath, mode);
+    this._runSync(() => fs.accessSync(realPath, mode));
   }
 
   async access(vfsPath, mode) {
     const realPath = this._resolvePathFollow(vfsPath);
-    return fs.promises.access(realPath, mode);
+    return this._runAsync(() => fs.promises.access(realPath, mode));
   }
 
   copyFileSync(srcVfsPath, destVfsPath, mode) {
     const srcRealPath = this._resolvePathFollow(srcVfsPath);
     const destRealPath = this._resolvePathFollow(destVfsPath);
-    fs.copyFileSync(srcRealPath, destRealPath, mode);
+    this._runSync(() => fs.copyFileSync(srcRealPath, destRealPath, mode));
   }
 
   async copyFile(srcVfsPath, destVfsPath, mode) {
     const srcRealPath = this._resolvePathFollow(srcVfsPath);
     const destRealPath = this._resolvePathFollow(destVfsPath);
-    return fs.promises.copyFile(srcRealPath, destRealPath, mode);
+    return this._runAsync(() => fs.promises.copyFile(srcRealPath, destRealPath, mode));
   }
 
   // XXX(patch): Custom code/changes added for Gondolin
@@ -509,7 +584,7 @@ class RealFSProvider extends VirtualProvider {
     }
 
     const realPath = this._resolvePathFollow(vfsPath);
-    const stats = await fs.promises.statfs(realPath);
+    const stats = await this._runAsync(() => fs.promises.statfs(realPath));
     const bsize = Number(stats.bsize ?? 4096);
 
     return {
