@@ -82,7 +82,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 struct Input {
     policy: u8,
     response: bool,
-    gzip: bool,
+    coding: u8,
     status: u16,
     method: String,
     url: String,
@@ -98,8 +98,10 @@ fuzz_target!(|input: Input| {
     runtime().block_on(async {
         if input.response {
             let mut headers = input.headers.clone();
-            if input.gzip {
-                headers.push(("content-encoding".into(), "gzip".into()));
+            // none, gzip, br, zstd: every coding the hook decodes
+            let coding = [None, Some("gzip"), Some("br"), Some("zstd")][input.coding as usize % 4];
+            if let Some(c) = coding {
+                headers.push(("content-encoding".into(), c.into()));
             }
             let res = ResponseHead { status: input.status, status_text: "OK".into(), headers };
             let _ = hooks.on_response(res, Some(body.handle()), head).await;

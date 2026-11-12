@@ -1,6 +1,7 @@
 use super::*;
 use gondolin_egress::{HookBody, PullableBody};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -587,6 +588,40 @@ async fn encoded_responses_are_decoded_for_the_hook() {
 }
 
 // ---- shim semantics ----
+
+#[tokio::test]
+async fn zstd_and_brotli_responses_are_decoded_for_the_hook() {
+    for (coding, body) in [
+        (
+            "zstd",
+            ruzstd::encoding::compress_to_vec(
+                &b"compressed text"[..],
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        ),
+        ("br", {
+            let mut out = Vec::new();
+            brotli::CompressorReader::new(&b"compressed text"[..], 4096, 5, 20)
+                .read_to_end(&mut out)
+                .unwrap();
+            out
+        }),
+    ] {
+        let head = response(
+            200,
+            &[("content-encoding", coding), ("content-length", &body.len().to_string())],
+        );
+        let h = hooks(
+            "async function onResponse(res) { return new Response((await res.text()).toUpperCase(), res); }",
+        );
+        let p = pullable(body);
+        let d =
+            bounded(h.on_response(head, Some(p.handle()), get("http://a.test/"))).await.unwrap();
+        let ResponseDecision::Response { head: out, body } = d else { panic!() };
+        assert_eq!(out.header("content-encoding"), None);
+        assert_eq!(bytes_of(body).await, b"COMPRESSED TEXT");
+    }
+}
 
 /// Runs `expr` (an expression over `req`) in onRequest and returns its JSON.
 async fn eval(expr: &str) -> String {

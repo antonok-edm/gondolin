@@ -183,10 +183,10 @@ GET and HEAD requests that carry a body are rejected with `400` when an
 request that produced it (the final hop, after secret substitution). Return
 `undefined` to forward the response unchanged or a `Response` to replace it.
 
-Compressed upstream responses (`Content-Encoding: gzip`, `deflate`, ...) are
-decoded for the hook, which sees them without `Content-Encoding`, like a
-`fetch()` response. When the hook returns `undefined` the guest receives the
-original, still compressed, bytes.
+Compressed upstream responses (`Content-Encoding: gzip`, `deflate`, `br`,
+`zstd`, ...) are decoded for the hook, which sees them without
+`Content-Encoding`, like a `fetch()` response. When the hook returns
+`undefined` the guest receives the original, still compressed, bytes.
 
 ### Request and Response Bodies
 
@@ -324,8 +324,8 @@ The policy can use `Request`, `Response`, `Headers`, `URL`,
   through.
 - As in your process, forwarding a request whose body the hook consumed is
   refused (`400`): read from `request.clone()`.
-- Compressed responses (`gzip`, `deflate`) are decoded for `onResponse`, as for
-  hooks in your process.
+- Compressed responses (`gzip`, `deflate`, `br`, `zstd`) are decoded for
+  `onResponse`, as for hooks in your process.
 
 ### Options
 

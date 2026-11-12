@@ -57,7 +57,7 @@ async function onRequest(req) {
 
 async function onResponse(response, request) {
   const url = new URL(request.url);
-  if (url.pathname === "/upper" || url.pathname === "/gz") {
+  if (url.pathname === "/upper" || url.pathname === "/gz" || url.pathname === "/zstd") {
     const text = await response.text();
     return new Response(text.toUpperCase(), {
       status: response.status,
@@ -93,6 +93,15 @@ async function upstream(): Promise<number> {
           "content-length": String(gz.length),
         });
         res.end(gz);
+        return;
+      }
+      if (url.pathname === "/zstd") {
+        const z = zlib.zstdCompressSync(Buffer.from("hello zstd"));
+        res.writeHead(200, {
+          "content-encoding": "zstd",
+          "content-length": String(z.length),
+        });
+        res.end(z);
         return;
       }
       const body = Buffer.concat(chunks);
@@ -184,6 +193,8 @@ test(
         assert.match(upper.stdout, /GET \/UPPER AUTH=- SAW=FALSE LEN=0\n 200$/);
         const gz = await sh(vm, curl(p, `${base}/gz`));
         assert.equal(gz.stdout, "HELLO GZIP 200");
+        const zstd = await sh(vm, curl(p, `${base}/zstd`));
+        assert.equal(zstd.stdout, "HELLO ZSTD 200");
 
         // the declarative allowlist still applies around tier 2
         const denied = await sh(

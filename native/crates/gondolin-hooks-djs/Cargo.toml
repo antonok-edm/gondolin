@@ -18,6 +18,8 @@ miniz_oxide = "0.9"
 # Earendil's JavaScript engine (first-party, not counted in native/deps-budget);
 # every use of its API is in src/engine.rs
 djs-embed = { git = "https://github.com/earendil-works/djs.git", rev = "0e58f62c80252fc3f4156ab7a3744746434ed860" }
+ruzstd = "0.9.1"
+brotli = "9.1.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

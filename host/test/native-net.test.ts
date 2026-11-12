@@ -33,6 +33,76 @@ function fakeTransport(streams: Record<number, Uint8Array[]>) {
   return { transport, pulls, released };
 }
 
+test("native net: onResponse decodes zstd and brotli bodies", async () => {
+  for (const [encoding, body] of [
+    ["zstd", zlib.zstdCompressSync(Buffer.from("payload zstd"))],
+    ["br", zlib.brotliCompressSync(Buffer.from("payload brotli"))],
+  ] as const) {
+    const { svc } = service(
+      {
+        onResponse: async (res) => {
+          assert.equal(res.headers.get("content-encoding"), null);
+          const text = await res.text();
+          return new Response(text.toUpperCase(), {
+            status: res.status,
+            headers: res.headers,
+          });
+        },
+      },
+      { 2: [new Uint8Array(body)] },
+    );
+    const decision = await svc.handle({
+      phase: "on_response",
+      request: { method: "GET", url: "https://example.com/", headers: [] },
+      response: {
+        status: 200,
+        status_text: "OK",
+        headers: [
+          ["content-encoding", encoding],
+          ["content-length", String(body.length)],
+        ],
+        body: 2,
+      },
+    });
+    assert.ok(decision.action === "response");
+    assert.ok(decision.body.kind === "bytes");
+    assert.equal(
+      new TextDecoder().decode(decision.body.data),
+      `PAYLOAD ${encoding === "zstd" ? "ZSTD" : "BROTLI"}`,
+    );
+    assert.ok(!decision.response.headers.some(([k]) => k === "content-encoding"));
+  }
+});
+
+test("native net: decoded zstd hook bodies are limited (decompression bombs)", async () => {
+  const bomb = new Uint8Array(zlib.zstdCompressSync(Buffer.alloc(4 * 1024 * 1024)));
+  const fake = fakeTransport({ 2: [bomb] });
+  const svc = new NativeHookService(
+    { onResponse: async (res) => new Response(await res.text()) },
+    {
+      transport: fake.transport,
+      maxRequestBodyBytes: 1024,
+      maxResponseBodyBytes: 64 * 1024,
+    },
+  );
+  const decision = await svc.handle({
+    phase: "on_response",
+    request: { method: "GET", url: "https://example.com/", headers: [] },
+    response: {
+      status: 200,
+      status_text: "OK",
+      headers: [["content-encoding", "zstd"]],
+      body: 2,
+    },
+  });
+  if (decision.action !== "block") {
+    throw new Error(`unexpected decision: ${decision.action}`);
+  }
+  // exact message differs by Node version (buffered vs DecompressionStream)
+  assert.equal(decision.status, 502);
+  assert.match(decision.message, /exceeds 65536 bytes/);
+});
+
 const enc = (s: string) => new TextEncoder().encode(s);
 
 function concat(chunks: Uint8Array[]): Uint8Array {

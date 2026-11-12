@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import tls from "node:tls";
+import { zstdDecompressSync } from "node:zlib";
 
 import {
   NATIVE_HTTP_POLICY,
@@ -841,7 +842,7 @@ function limitStream(max: number): TransformStream<Uint8Array, Uint8Array> {
 
 const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
 
-type DecodeFormat = "gzip" | "deflate" | "brotli";
+type DecodeFormat = "gzip" | "deflate" | "brotli" | "zstd";
 
 let brotliSupported: boolean | undefined;
 
@@ -857,6 +858,20 @@ function supportsBrotli(): boolean {
   return brotliSupported;
 }
 
+let zstdStreamingSupported: boolean | undefined;
+
+function supportsZstdStreaming(): boolean {
+  if (zstdStreamingSupported === undefined) {
+    try {
+      new DecompressionStream("zstd" as "gzip");
+      zstdStreamingSupported = true;
+    } catch {
+      zstdStreamingSupported = false;
+    }
+  }
+  return zstdStreamingSupported;
+}
+
 /** Decoder for a single content-encoding (the ones undici's fetch decodes) */
 function decoderFor(encoding: string | null): DecodeFormat | null {
   switch (encoding?.trim().toLowerCase()) {
@@ -867,9 +882,59 @@ function decoderFor(encoding: string | null): DecodeFormat | null {
       return "deflate";
     case "br":
       return supportsBrotli() ? "brotli" : null;
+    case "zstd":
+      // Node has zlib zstd support but no `DecompressionStream("zstd")` until
+      // v25: decode buffered when streaming is unavailable
+      return supportsZstdStreaming() || typeof zstdDecompressSync === "function"
+        ? "zstd"
+        : null;
     default:
       return null;
   }
+}
+
+/** Errors the stream like the decoded-body limit, for a `502` block */
+function decodedBodyTooLarge(max: number): HttpRequestBlockedError {
+  return new HttpRequestBlockedError(
+    `decoded response body exceeds ${max} bytes`,
+    502,
+    "Bad Gateway",
+  );
+}
+
+/**
+ * Buffered zstd decoder for Node builds without `DecompressionStream("zstd")`:
+ * accumulates the encoded body (bounded by the daemon's body limit) and
+ * decodes it once, rejecting bodies whose decoded size exceeds `max` bytes
+ * (decompression bombs, like `limitStream`).
+ */
+function zstdDecodeStream(max: number): TransformStream<Uint8Array, Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      total += chunk.byteLength;
+      if (total > max) {
+        controller.error(decodedBodyTooLarge(max));
+        return;
+      }
+      chunks.push(chunk);
+    },
+    flush(controller) {
+      let decoded: Buffer;
+      try {
+        decoded = zstdDecompressSync(Buffer.concat(chunks), { maxOutputLength: max });
+      } catch (err) {
+        controller.error(
+          (err as NodeJS.ErrnoException)?.code === "ERR_BUFFER_TOO_LARGE"
+            ? decodedBodyTooLarge(max)
+            : err,
+        );
+        return;
+      }
+      controller.enqueue(new Uint8Array(decoded));
+    },
+  });
 }
 
 /**
@@ -1164,17 +1229,18 @@ export class NativeHookService {
             prefix: head.body_prefix,
             complete: head.body_complete,
           });
-          return format
-            ? raw
-                .pipeThrough(
-                  new DecompressionStream(
-                    format as "gzip",
-                  ) as unknown as TransformStream<Uint8Array, Uint8Array>,
-                )
-                // the daemon limits the encoded bytes; bound the decoded ones
-                // too (decompression bombs), like node's buffered limit
-                .pipeThrough(limitStream(this.maxResponseBodyBytes))
-            : raw;
+          if (!format) return raw;
+          const decoder =
+            format === "zstd" && !supportsZstdStreaming()
+              ? zstdDecodeStream(this.maxResponseBodyBytes)
+              : (new DecompressionStream(
+                  format as "gzip",
+                ) as unknown as TransformStream<Uint8Array, Uint8Array>);
+          return raw
+            .pipeThrough(decoder)
+            // the daemon limits the encoded bytes; bound the decoded ones
+            // too (decompression bombs), like node's buffered limit
+            .pipeThrough(limitStream(this.maxResponseBodyBytes));
         }
       : null;
     if (makeBody && format) {
